@@ -19,8 +19,10 @@ import hashlib
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 # Defina estas variaveis de ambiente no Railway:
