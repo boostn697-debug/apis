@@ -19,10 +19,21 @@ import hashlib
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 from flask import Flask, request, jsonify
-from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app)
+
+# CORS — permite requisicoes do panel.html local
+@app.after_request
+def add_cors(response):
+    response.headers["Access-Control-Allow-Origin"]  = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Admin-Token"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
+
+@app.route("/", defaults={"path": ""}, methods=["OPTIONS"])
+@app.route("/<path:path>", methods=["OPTIONS"])
+def options_handler(path):
+    return jsonify({}), 200
 
 # ── Config ────────────────────────────────────────────────────────────────────
 # Defina estas variaveis de ambiente no Railway:
