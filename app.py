@@ -245,23 +245,41 @@ def admin_failure_limited(ip_hash: str) -> bool:
     return count >= ADMIN_FAIL_MAX
 
 
+def clear_admin_failures(ip_hash: str):
+    """Limpa tentativas administrativas erradas após autenticação válida."""
+    with get_db() as c:
+        c.execute(
+            "DELETE FROM rate_events WHERE scope='admin_fail' AND subject=?",
+            (ip_hash,),
+        )
+        c.commit()
+
+
 def admin_only(f):
     @wraps(f)
     def wrap(*args, **kwargs):
         ip_hash = sha256_text(client_ip())
 
-        if admin_failure_limited(ip_hash):
-            return jsonify({"success": False, "message": "Muitas tentativas. Aguarde alguns minutos."}), 429
-
-        # Keep frontend compatibility: it sends the 8-digit password in X-Admin-Token.
+        # O painel envia a senha de 8 dígitos neste header.
         supplied = (request.headers.get("X-Admin-Token") or "").strip()
 
-        if not secrets.compare_digest(supplied, ADMIN_TOKEN):
-            record_admin_failure(ip_hash)
-            # Same generic reply for every incorrect password.
-            return jsonify({"success": False, "message": "Senha administrativa invalida."}), 401
+        # Senha correta SEMPRE entra, mesmo se houve erros anteriores.
+        if secrets.compare_digest(supplied, ADMIN_TOKEN):
+            clear_admin_failures(ip_hash)
+            return f(*args, **kwargs)
 
-        return f(*args, **kwargs)
+        # O bloqueio vale somente para novas tentativas com senha errada.
+        if admin_failure_limited(ip_hash):
+            return jsonify({
+                "success": False,
+                "message": "Muitas tentativas com senha incorreta. Aguarde alguns minutos."
+            }), 429
+
+        record_admin_failure(ip_hash)
+        return jsonify({
+            "success": False,
+            "message": "Senha administrativa invalida."
+        }), 401
 
     return wrap
 
@@ -285,10 +303,31 @@ def sharing_detected(key: str, current_ip_hash: str) -> bool:
     return distinct_ips >= MAX_IPS_PER_KEY_DAY
 
 
+PUBLIC_LICENSE_MESSAGES = {
+    "invalid_key": "Licenca invalida.",
+    "revoked": "Licenca revogada.",
+    "expired": "Licenca expirada.",
+    "hwid_banned": "Este computador foi banido.",
+    "ip_blocked": "Este IP foi bloqueado.",
+    "hwid_mismatch": "Licenca vinculada a outro computador.",
+    "sharing_detected": "Atividade suspeita detectada.",
+    "activation_race": "Nao foi possivel concluir a ativacao. Tente novamente.",
+    "rate_limited_ip": "Muitas tentativas. Aguarde e tente novamente.",
+    "rate_limited_key": "Muitas tentativas. Aguarde e tente novamente.",
+}
+
+
 def public_denied(key: str, hwid_hash: str, ip_hash: str, internal_result: str, status=200):
+    """Registra o motivo real e devolve um status simples para o loader."""
     log_event(key, hwid_hash, ip_hash, internal_result)
-    # Avoid exposing whether a guessed key exists, is revoked, expired, etc.
-    return jsonify({"success": False, "message": "Licenca invalida ou indisponivel."}), status
+    return jsonify({
+        "success": False,
+        "status": internal_result,
+        "message": PUBLIC_LICENSE_MESSAGES.get(
+            internal_result,
+            "Licenca invalida ou indisponivel."
+        ),
+    }), status
 
 
 # ── Health ────────────────────────────────────────────────────
@@ -302,13 +341,13 @@ def health():
 def validate():
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
-        return jsonify({"success": False, "message": "JSON invalido."}), 400
+        return jsonify({"success": False, "status": "invalid_request", "message": "JSON invalido."}), 400
 
     key = str(data.get("key") or "").strip().upper()
     hwid = str(data.get("hwid") or "").strip()
 
     if not key or not hwid or len(key) > 160 or len(hwid) > 512:
-        return jsonify({"success": False, "message": "Dados invalidos."}), 400
+        return jsonify({"success": False, "status": "invalid_request", "message": "Dados invalidos."}), 400
 
     ip = client_ip()
     ip_hash = sha256_text(ip)
@@ -316,12 +355,12 @@ def validate():
 
     if rate_limited("validate_ip", ip_hash, VALIDATE_RATE_MAX, VALIDATE_RATE_WINDOW):
         log_event(key, hwid_hash, ip_hash, "rate_limited_ip")
-        return jsonify({"success": False, "message": "Muitas tentativas. Aguarde."}), 429
+        return jsonify({"success": False, "status": "rate_limited_ip", "message": "Muitas tentativas. Aguarde."}), 429
 
     key_subject = sha256_text(key)
     if rate_limited("validate_key", key_subject, KEY_RATE_MAX, KEY_RATE_WINDOW):
         log_event(key, hwid_hash, ip_hash, "rate_limited_key")
-        return jsonify({"success": False, "message": "Muitas tentativas. Aguarde."}), 429
+        return jsonify({"success": False, "status": "rate_limited_key", "message": "Muitas tentativas. Aguarde."}), 429
 
     # Block list checks.
     with get_db() as c:
@@ -372,7 +411,7 @@ def validate():
             if sharing_detected(key, ip_hash):
                 c.rollback()
                 log_event(key, hwid_hash, ip_hash, "sharing_detected")
-                return jsonify({"success": False, "message": "Atividade suspeita detectada."}), 403
+                return jsonify({"success": False, "status": "sharing_detected", "message": "Atividade suspeita detectada."}), 403
 
             c.execute(
                 "UPDATE licenses SET use_count=use_count+1,last_seen=? WHERE key=?",
@@ -383,6 +422,7 @@ def validate():
     log_event(key, hwid_hash, ip_hash, "ok")
     return jsonify({
         "success": True,
+        "status": "ok",
         "message": "ok",
         "expiry": expiry_fmt(row["expires_at"]),
     }), 200
@@ -588,7 +628,6 @@ def get_logs():
         "logs": [{
             "id": r["id"],
             "key": r["key"],
-            "hwid": r["hwid"],
             "ip": r["ip"],
             "result": r["result"],
             "ts": datetime.fromtimestamp(r["ts"], timezone.utc).strftime("%d/%m/%Y %H:%M:%S"),
