@@ -588,6 +588,7 @@ def get_logs():
         "logs": [{
             "id": r["id"],
             "key": r["key"],
+            "hwid": r["hwid"],
             "ip": r["ip"],
             "result": r["result"],
             "ts": datetime.fromtimestamp(r["ts"], timezone.utc).strftime("%d/%m/%Y %H:%M:%S"),
