@@ -20,7 +20,14 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 32 * 1024  # 32 KiB per request
 
 # ── Config ────────────────────────────────────────────────────
-DB_PATH = os.environ.get("DB_PATH", "licenses.db")
+# DB_PATH: usa /var/data se existir (volume persistente do Render),
+# senão cai para o diretório local (dev ou Render sem volume).
+_RENDER_VOLUME = "/var/data"
+if os.path.isdir(_RENDER_VOLUME):
+    DB_PATH = os.path.join(_RENDER_VOLUME, "licenses.db")
+else:
+    DB_PATH = os.environ.get("DB_PATH", "licenses.db")
+
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
 
 # User explicitly wants a short numeric admin password.
@@ -133,6 +140,79 @@ def init_db():
 
 init_db()
 
+
+# ── Auto-restore: recarrega backup se banco estiver vazio ─────
+# Garante que após reinício do Render (filesystem efêmero),
+# todas as keys voltam automaticamente do último backup salvo.
+BACKUP_PATH = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "licenses_backup.json")
+
+def auto_restore_from_backup():
+    """
+    Se o banco estiver vazio (recém-criado após reinício) e existir
+    licenses_backup.json no mesmo diretório do DB, restaura tudo.
+    """
+    import json as _json
+
+    with get_db() as c:
+        count = c.execute("SELECT COUNT(*) FROM licenses").fetchone()[0]
+        if count > 0:
+            return  # Banco já tem dados, não precisa restaurar
+
+    if not os.path.exists(BACKUP_PATH):
+        return
+
+    try:
+        with open(BACKUP_PATH, "r", encoding="utf-8") as f:
+            backup = _json.load(f)
+    except Exception:
+        return
+
+    keys_list = backup.get("keys", [])
+    if not keys_list:
+        return
+
+    with get_db() as c:
+        for k in keys_list:
+            key_str    = str(k.get("key") or "").strip().upper()
+            expiry_obj = k.get("expires") or {}
+            expires_ts = int(expiry_obj.get("timestamp") or 0) if isinstance(expiry_obj, dict) else int(expiry_obj or 0)
+
+            if not key_str or expires_ts <= 0:
+                continue
+
+            c.execute(
+                "INSERT OR IGNORE INTO licenses "
+                "(key, hwid, expires_at, created_at, note, active) VALUES (?,?,?,?,?,?)",
+                (
+                    key_str,
+                    k.get("hwid") or None,
+                    expires_ts,
+                    now(),
+                    str(k.get("note") or "")[:250],
+                    1 if k.get("active", True) else 0,
+                ),
+            )
+
+        for b in backup.get("banned_hwids", []):
+            hwid_val = str(b.get("hwid") or "").strip()
+            if hwid_val:
+                c.execute(
+                    "INSERT OR IGNORE INTO banned_hwids (hwid, reason, banned_at) VALUES (?,?,?)",
+                    (hwid_val, b.get("reason", ""), now()),
+                )
+
+        for ip_item in backup.get("blocked_ips", []):
+            ip_val = str(ip_item.get("ip") or "").strip()
+            if ip_val:
+                c.execute(
+                    "INSERT OR IGNORE INTO blocked_ips (ip, reason, blocked_at) VALUES (?,?,?)",
+                    (ip_val, ip_item.get("reason", ""), now()),
+                )
+
+        c.commit()
+
+
+auto_restore_from_backup()
 
 # ── Helpers ───────────────────────────────────────────────────
 def now() -> int:
@@ -351,23 +431,28 @@ def validate():
 
     ip = client_ip()
     ip_hash = sha256_text(ip)
-    hwid_hash = sha256_text(hwid)
+    # HWID é salvo e comparado em texto puro — o valor real do MachineGuid
+    # ex: B1D963CA233C4ECFB27E605AF91FC920
+    # Apenas o IP continua em hash por ser dado sensível de rede.
+    hwid_upper = hwid.upper()
+    # Para checagem na banned_hwids usamos sha256 do hwid (compatível com ban_hwid)
+    hwid_hash  = sha256_text(hwid_upper)
 
     if rate_limited("validate_ip", ip_hash, VALIDATE_RATE_MAX, VALIDATE_RATE_WINDOW):
-        log_event(key, hwid_hash, ip_hash, "rate_limited_ip")
+        log_event(key, hwid_upper, ip_hash, "rate_limited_ip")
         return jsonify({"success": False, "status": "rate_limited_ip", "message": "Muitas tentativas. Aguarde."}), 429
 
     key_subject = sha256_text(key)
     if rate_limited("validate_key", key_subject, KEY_RATE_MAX, KEY_RATE_WINDOW):
-        log_event(key, hwid_hash, ip_hash, "rate_limited_key")
+        log_event(key, hwid_upper, ip_hash, "rate_limited_key")
         return jsonify({"success": False, "status": "rate_limited_key", "message": "Muitas tentativas. Aguarde."}), 429
 
     # Block list checks.
     with get_db() as c:
         if c.execute("SELECT 1 FROM blocked_ips WHERE ip=?", (ip_hash,)).fetchone():
-            return public_denied(key, hwid_hash, ip_hash, "ip_blocked", 403)
+            return public_denied(key, hwid_upper, ip_hash, "ip_blocked", 403)
         if c.execute("SELECT 1 FROM banned_hwids WHERE hwid=?", (hwid_hash,)).fetchone():
-            return public_denied(key, hwid_hash, ip_hash, "hwid_banned", 403)
+            return public_denied(key, hwid_upper, ip_hash, "hwid_banned", 403)
 
     # Atomic first-device binding. BEGIN IMMEDIATE prevents two PCs from both
     # winning the first activation race on an unbound license.
@@ -377,40 +462,38 @@ def validate():
 
         if not row:
             c.rollback()
-            return public_denied(key, hwid_hash, ip_hash, "invalid_key")
+            return public_denied(key, hwid_upper, ip_hash, "invalid_key")
 
         if not row["active"]:
             c.rollback()
-            return public_denied(key, hwid_hash, ip_hash, "revoked")
+            return public_denied(key, hwid_upper, ip_hash, "revoked")
 
         if row["expires_at"] <= now():
             c.rollback()
-            return public_denied(key, hwid_hash, ip_hash, "expired")
+            return public_denied(key, hwid_upper, ip_hash, "expired")
 
         stored_hwid = row["hwid"]
 
         if stored_hwid is None:
+            # Primeira ativação: salva o HWID puro (ex: B1D963CA233C4ECFB27E605AF91FC920)
             changed = c.execute(
                 "UPDATE licenses SET hwid=?, use_count=use_count+1, last_seen=? "
                 "WHERE key=? AND hwid IS NULL",
-                (hwid_hash, now(), key),
+                (hwid_upper, now(), key),
             ).rowcount
             if changed != 1:
-                # Defensive fallback; the immediate transaction should already serialize this.
                 c.rollback()
-                return public_denied(key, hwid_hash, ip_hash, "activation_race")
+                return public_denied(key, hwid_upper, ip_hash, "activation_race")
             c.commit()
 
-        elif not secrets.compare_digest(stored_hwid, hwid_hash):
+        elif stored_hwid.upper() != hwid_upper:
             c.rollback()
-            # Do NOT permanently auto-ban a client-supplied HWID from one mismatch;
-            # that can be weaponized to ban innocent devices.
-            return public_denied(key, hwid_hash, ip_hash, "hwid_mismatch")
+            return public_denied(key, hwid_upper, ip_hash, "hwid_mismatch")
 
         else:
             if sharing_detected(key, ip_hash):
                 c.rollback()
-                log_event(key, hwid_hash, ip_hash, "sharing_detected")
+                log_event(key, hwid_upper, ip_hash, "sharing_detected")
                 return jsonify({"success": False, "status": "sharing_detected", "message": "Atividade suspeita detectada."}), 403
 
             c.execute(
@@ -419,7 +502,7 @@ def validate():
             )
             c.commit()
 
-    log_event(key, hwid_hash, ip_hash, "ok")
+    log_event(key, hwid_upper, ip_hash, "ok")
     return jsonify({
         "success": True,
         "status": "ok",
@@ -523,6 +606,63 @@ def reset_hwid():
     return jsonify({"success": True, "message": "HWID resetado."})
 
 
+@app.route("/restore_key", methods=["POST"])
+@admin_only
+def restore_key():
+    """
+    Restaura uma key específica no banco (usada pelo sync_db.py após reinício do Render).
+    Se a key já existir, apenas atualiza note/active/expires_at.
+    """
+    data = request.get_json(silent=True) or {}
+    key       = str(data.get("key") or "").strip().upper()
+    expires_at = int(data.get("expires_at") or 0)
+    note      = str(data.get("note") or "")[:250]
+    active    = 1 if data.get("active", True) else 0
+    hwid      = data.get("hwid")  # pode ser None/null
+
+    if not key or expires_at <= 0:
+        return jsonify({"success": False, "message": "key e expires_at sao obrigatorios."}), 400
+
+    created = now()
+    with get_db() as c:
+        existing = c.execute("SELECT key FROM licenses WHERE key=?", (key,)).fetchone()
+        if existing:
+            c.execute(
+                "UPDATE licenses SET expires_at=?, note=?, active=? WHERE key=?",
+                (expires_at, note, active, key),
+            )
+        else:
+            c.execute(
+                "INSERT INTO licenses (key, hwid, expires_at, created_at, note, active) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (key, hwid, expires_at, created, note, active),
+            )
+        c.commit()
+
+    return jsonify({"success": True, "message": "Key restaurada.", "created": not bool(existing)})
+
+
+@app.route("/save_backup", methods=["POST"])
+@admin_only
+def save_backup():
+    """
+    Recebe o JSON de backup do sync_db.py / painel e salva em
+    licenses_backup.json no servidor. Usado para garantir que o
+    auto_restore sempre tem o arquivo mais recente disponível.
+    """
+    import json as _json
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"success": False, "message": "JSON invalido."}), 400
+
+    try:
+        with open(BACKUP_PATH, "w", encoding="utf-8") as f:
+            _json.dump(data, f, ensure_ascii=False)
+        return jsonify({"success": True, "message": "Backup salvo no servidor."})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
 @app.route("/ban_hwid", methods=["POST"])
 @admin_only
 def ban_hwid():
@@ -607,6 +747,7 @@ def list_keys():
         "keys": [{
             "key": r["key"],
             "hwid_bound": r["hwid"] is not None,
+            "hwid": r["hwid"] or "",          # HWID real ex: B1D963CA233C4ECFB27E605AF91FC920
             "active": bool(r["active"]),
             "note": r["note"] or "",
             "use_count": r["use_count"],
@@ -628,6 +769,7 @@ def get_logs():
         "logs": [{
             "id": r["id"],
             "key": r["key"],
+            "hwid": r["hwid"] or "",          # HWID real do cliente
             "ip": r["ip"],
             "result": r["result"],
             "ts": datetime.fromtimestamp(r["ts"], timezone.utc).strftime("%d/%m/%Y %H:%M:%S"),
